@@ -1,15 +1,53 @@
+"""
+Eval plan:
+    1. DONE: refactor existing system to accept a market id param
+    2. design a eval db with input market ids and output AnalystResults and Verdicts
+    3. run a loop to graph.ainvoke() with every input value in eval db
+    4. collect the results in an evaluable format dict (in loop)
+    5. design a new populatable object that has:
+        5 criteria (out of 20, to add up to 100)
+        feedback category
+    6. run ChatOpenAI.with_structured_output for every execution of the graph in the evaluable dict
+    7. Average every score (out of 100) and collect feedback from the object
+"""
+from typing import Annotated, TypedDict, Literal, Dict, Union
+from langchain.agents import create_agent
 from openai import OpenAI
-import os
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from polymarket import AsyncPublicClient
-import asyncio
-import random
-import json
+from polymarket import AsyncPublicClient 
+from langgraph.graph import END, START, StateGraph
+from langchain_core.tools import tool
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+import asyncio, random, os
+
+from pydantic import BaseModel
+
+
+class AnalystResult(BaseModel):
+    main_reason: str = Field(description="The main reason why the judge should support your side.")
+    additional_reasoning: str = Field(description="Additional reasoning to support your analysis. Keep it to 5-6 sentences, and 8 sentences maximum.")
+class Verdict(BaseModel):
+    final_decision: Literal["BEAR", "BULL"] = Field(description="Your final decision. Should be either \"BEAR\" or \"BULL\"")
+    reasoning: str = Field(description="Additional reasoning to support your decision. Keep it to 5-6 sentences, and 8 sentences maximum.")
+
+class State(TypedDict):
+    market_id: int
+    random_market_chosen: Dict[str, Union[int, str]]
+    bull_system_prompt: SystemMessage
+    bear_system_prompt: SystemMessage
+    bear_result: AnalystResult
+    bull_result: AnalystResult
+    judge_messages: list[BaseMessage]
+    verdict: Verdict
 
 load_dotenv()
 openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+@tool
 async def search(question: str) -> list[dict]:
+    """A search tool. Takes a question and returns web search outputs."""
     response = await asyncio.to_thread(openai.responses.create,
         model="gpt-4o-mini",
         tools=[{"type": "web_search"}],
@@ -19,18 +57,21 @@ async def search(question: str) -> list[dict]:
     print("used tool: search")
     return [{"question": question}, {"search results": response.output_text}]
 
-async def random_market():
+async def random_market(id: int = None):
     async with AsyncPublicClient() as client:
-        markets = client.list_markets(closed=False, page_size=100)
-        first_page = await markets.first_page()
-        items = first_page.items
-        chosen = random.choice(items)
+        if id:
+            chosen = await client.get_market(id=id)
+        else:
+            markets = client.list_markets(closed=False, page_size=100)
+            first_page = await markets.first_page()
+            items = first_page.items
+            chosen = random.choice(items)
         print(chosen.question, chosen.description)
     return {"id": chosen.id, "question": chosen.question, "description": chosen.description}
 
-
-
+@tool
 async def market_lookup(market_id: str):
+    """A market lookup tool. Takes a market_id and returns values of the market"""
     print("used tool: market lookup")
     async with AsyncPublicClient() as client:
         market = await client.get_market(id=market_id)
@@ -49,143 +90,111 @@ async def market_lookup(market_id: str):
                     },
                 }
 
+tools = [market_lookup, search]
 
 
-search_json = {
-    "name": "search",
-    "description": "Search the web for recent news and information",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string"}
-        },
-        "required": ["question"],
-        "additionalProperties": False
-    }
-}
+async def setup(state: State) -> State:
 
-market_lookup_json = {
-    "name": "market_lookup",
-    "description": "Look up Market information by Market id",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "market_id": {"type": "string"}
-        },
-        "required": ["market_id"],
-        "additionalProperties": False
-    }
-}
+    if state.get("market_id"):
+        state["random_market_chosen"] = await random_market(id=state["market_id"])
+    else:
+        state["random_market_chosen"] = await random_market()
 
-tools = [
-    {"type": "function", "function": search_json},
-    {"type": "function", "function": market_lookup_json},
-]
+    state["bull_system_prompt"] = SystemMessage(content="""
+    You are a bull analyst arguing that the answer to this prediction market is YES.
+    Use your market_lookup and search tools to find evidence. Be persuasive and specific.
+    """)
 
-bull_system_prompt = """
-You are a bull analyst arguing that the answer to this prediction market is YES. 
-Use your market_lookup and search tools to find evidence. Be persuasive and specific.
-"""
+    state["bear_system_prompt"] = SystemMessage(content="""
+    You are a bear analyst arguing that the answer to this prediction market is NO.
+    Use your market_lookup and search tools to find evidence. Be persuasive and specific.
+    """)
 
-bear_system_prompt = """
-You are a bear analyst arguing that the answer to this prediction market is NO.
-Use your market_lookup and search tools to find evidence. Be persuasive and specific.
-"""
+    return state
 
-bear_messages = [
-    {"role": "system", "content": bear_system_prompt}
-]
 
-bull_messages = [
-    {"role": "system", "content": bull_system_prompt},
-]
-
-async def bull():
-    response = await asyncio.to_thread(openai.chat.completions.create,
-    model="gpt-4o-mini",
-    messages=bull_messages,
-    tools=tools
+async def bull(state: State) -> Dict:
+    
+    llm = create_agent(
+        model = ChatOpenAI(model="gpt-4o-mini", temperature=0),
+        tools=tools,
+        system_prompt=state["bull_system_prompt"],
+        response_format=AnalystResult,
     )
 
-    cleaned = response.choices[0].message.content
+    response = await llm.ainvoke({"messages": HumanMessage(content=f"Here is the market ID: {state["random_market_chosen"]["id"]}.")})
 
-    bull_messages.append(response.choices[0].message)
+    response = response["structured_response"]
+
+    cleaned = f"main reason: {response.main_reason}\nreasoning: {response.additional_reasoning}"
+
     if cleaned:
         print(f"\n\n\n\n\n\n\nbull response: {cleaned}")
-    return response
+    return {"bull_result": response}
 
-async def bear():
-    response = await asyncio.to_thread(openai.chat.completions.create, 
-    model="gpt-4o-mini",
-    messages=bear_messages,
-    tools=tools
+async def bear(state: State) -> Dict:
+        
+    llm = create_agent(
+        model = ChatOpenAI(model="gpt-4o-mini", temperature=0),
+        tools=tools,
+        system_prompt=state["bear_system_prompt"],
+        response_format=AnalystResult,
     )
 
-    cleaned = response.choices[0].message.content
+    response = await llm.ainvoke({"messages": HumanMessage(content=f"Here is the market ID: {state["random_market_chosen"]["id"]}.")})
 
-    bear_messages.append(response.choices[0].message)
+    response = response["structured_response"]
+
+    cleaned = f"main reason: {response.main_reason}\nreasoning: {response.additional_reasoning}"
+
     if cleaned:
         print(f"\n\n\n\n\n\n\nbear response: {cleaned}")
-    return response
-
-
-async def main():
-    random_market_chosen = await random_market()
-    random_market_id = random_market_chosen["id"]
-    bull_messages.append({"role": "user", "content": f"Here is the market ID: {random_market_id}."})
-    bear_messages.append({"role": "user", "content": f"Here is the market ID: {random_market_id}."})
-
-    async def loop():
-        async def run_bull():
-            while True:
-                bull_message = await bull()
-
-                if bull_message.choices[0].finish_reason == "tool_calls":
-                    for tool_call in bull_message.choices[0].message.tool_calls:
-                        result = await globals().get(tool_call.function.name)(**json.loads(tool_call.function.arguments))
-                        bull_messages.append({"role": "tool", "content": json.dumps(result), "tool_call_id": tool_call.id})
-                elif bull_message.choices[0].finish_reason == "stop":
-                    break
-            
-            return bull_message.choices[0].message.content
-
-        async def run_bear():
-            while True:
-                bear_message = await bear()
-
-                if bear_message.choices[0].finish_reason == "tool_calls":
-                    for tool_call in bear_message.choices[0].message.tool_calls:
-                        result = await globals().get(tool_call.function.name)(**json.loads(tool_call.function.arguments))
-                        bear_messages.append({"role": "tool", "content": json.dumps(result), "tool_call_id": tool_call.id})
-                elif bear_message.choices[0].finish_reason == "stop":
-                    break
-            
-            return bear_message.choices[0].message.content
-
-        bull_result, bear_result = await asyncio.gather(run_bull(), run_bear())
-
-        return {"bull": bull_result, "bear": bear_result}
+    return {"bear_result": response}
     
 
-    judge_system_prompt = """
+def judge(state: State) -> Dict:
+    random_market_chosen = state["random_market_chosen"]
+    state["judge_messages"] = [SystemMessage(content="""
     You are an impartial judge evaluating two analysts' arguments about a prediction market question. 
     You will receive a bull case (arguing YES) and a bear case (arguing NO). 
     Evaluate the quality of evidence, logical consistency, and persuasiveness of each argument. 
     Declare a winner and explain your reasoning in 5-8 sentences.
+    """),
+    HumanMessage(content=f"""
+    Here is the bull analyst's response: \n    "Main Reason: {state["bull_result"].main_reason}\n    Additional Reasoning: {state["bull_result"].additional_reasoning}"\n\n
+    Here is the bear analyst's response: \n    "Main Reason: {state["bear_result"].main_reason}\n    Additional Reasoning: {state["bear_result"].additional_reasoning}"\n\n\n
+    Here is the question given: \n    "{random_market_chosen["question"]}"\n\n
+    Here is the question's description: \n    "{random_market_chosen["description"]}"
     """
+    )]
 
-    results = await loop()
-    bear_result = results["bear"]
-    bull_result = results["bull"]
 
-    judge = await asyncio.to_thread(openai.chat.completions.create,
-    model="gpt-5-nano",
-    messages=[
-        {"role": "system", "content": judge_system_prompt}, 
-        {"role": "user", "content": f"Here is the bull analyst's response: \"{bull_result}\"\n\n\n\n\nHere is the bear analyst's response: \"{bear_result}\"\n\n\n\n\nHere is the question given: \"{random_market_chosen["question"]}\"\n\n\n\n\nHere is the question's description: \"{random_market_chosen["description"]}\""}
-        ]
-    )
+    judge = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(Verdict)
+    result = judge.invoke(state["judge_messages"])
+    print(f"\n\n\n\n\n\njudge response: \nwinner: {result.final_decision}\nreasoning: {result.reasoning}")
+    return {"verdict": result}
 
-    print(f"\n\n\n\n\n\n\njudge's verdict: {judge.choices[0].message.content}")
+graph = StateGraph(State)
 
-asyncio.run(main())
+graph.add_node("setup", setup)
+graph.add_node("bull", bull)
+graph.add_node("bear", bear)
+graph.add_node("judge", judge)
+
+graph.add_edge(START, "setup")
+graph.add_edge("judge", END)
+
+graph.add_edge("setup", "bull")
+graph.add_edge("setup", "bear")
+
+graph.add_edge("bull", "judge")
+graph.add_edge("bear", "judge")
+
+compiled = graph.compile()
+
+def run_graph(args_dict):
+    return asyncio.run(compiled.ainvoke(args_dict))
+
+
+
+# print(result["verdict"], result["bear_result"], result["bull_result"])
