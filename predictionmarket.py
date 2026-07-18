@@ -10,20 +10,17 @@ Eval plan:
     6. run ChatOpenAI.with_structured_output for every execution of the graph in the evaluable dict
     7. Average every score (out of 100) and collect feedback from the object
 """
-from typing import Annotated, TypedDict, Literal, Dict, Union
+from typing import List, TypedDict, Literal, Dict, Union
 from langchain.agents import create_agent
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from polymarket import AsyncPublicClient 
+from polymarket import AsyncPublicClient, Market 
 from langgraph.graph import END, START, StateGraph
 from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 import asyncio, random, os
-
-from pydantic import BaseModel
-
 
 class AnalystResult(BaseModel):
     main_reason: str = Field(description="The main reason why the judge should support your side.")
@@ -33,7 +30,8 @@ class Verdict(BaseModel):
     reasoning: str = Field(description="Additional reasoning to support your decision. Keep it to 5-6 sentences, and 8 sentences maximum.")
 
 class State(TypedDict):
-    market_id: int
+    market_id: str
+    keywords: List[str]
     random_market_chosen: Dict[str, Union[int, str]]
     bull_system_prompt: SystemMessage
     bear_system_prompt: SystemMessage
@@ -48,26 +46,69 @@ openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 @tool
 async def search(question: str) -> list[dict]:
     """A search tool. Takes a question and returns web search outputs."""
+    print("used tool: search")
     response = await asyncio.to_thread(openai.responses.create,
         model="gpt-4o-mini",
         tools=[{"type": "web_search"}],
         input=question,
     )
 
-    print("used tool: search")
     return [{"question": question}, {"search results": response.output_text}]
 
-async def random_market(id: int = None):
+async def random_market(id: str = None, keywords: List[str] = []):
+
     async with AsyncPublicClient() as client:
         if id:
             chosen = await client.get_market(id=id)
+        elif keywords:
+            random.shuffle(keywords)
+            cands: List[Market] = []
+            found = False
+            lower, upper = 0.35, 0.65
+            for keyword in keywords:
+                paginator = client.search(q=keyword)
+                raw = await paginator.first_page()
+                for item in raw.items:
+                    for events in item.events:
+                        for market in events.markets:
+                            if market.state.active and lower < float(market.outcomes.yes.price) < upper:
+                                cands.append(market)
+                
+                if len(cands) != 0:
+                    chosen = random.choice(cands)
+                    found = True
+                    break
+                else:
+                    continue
+            
+            if not found:
+                raise LookupError(f"No active market found for all keywords: {keywords}")
+
+
         else:
             markets = client.list_markets(closed=False, page_size=100)
             first_page = await markets.first_page()
             items = first_page.items
             chosen = random.choice(items)
         print(chosen.question, chosen.description)
-    return {"id": chosen.id, "question": chosen.question, "description": chosen.description}
+    return {
+        "id": chosen.id,
+        "question": chosen.question, 
+        "description": chosen.description, 
+        "temp":  {
+                    "market question": chosen.question, 
+                    "market description": chosen.description, 
+                    "market prices": {
+                        "last trade price": float(chosen.prices.last_trade_price),
+                        "one week change": float(chosen.prices.one_week_price_change or 0),
+                        "one month change": float(chosen.prices.one_month_price_change or 0),
+                        "one year change": float(chosen.prices.one_year_price_change or 0),
+                    },
+                    "market probabilities": {
+                        "yes price": float(chosen.outcomes.yes.price),
+                        "no price": float(chosen.outcomes.no.price),
+                    },
+                }}
 
 @tool
 async def market_lookup(market_id: str):
@@ -75,7 +116,7 @@ async def market_lookup(market_id: str):
     print("used tool: market lookup")
     async with AsyncPublicClient() as client:
         market = await client.get_market(id=market_id)
-        return {
+        temp = {
                     "market question": market.question, 
                     "market description": market.description, 
                     "market prices": {
@@ -89,6 +130,7 @@ async def market_lookup(market_id: str):
                         "no price": float(market.outcomes.no.price),
                     },
                 }
+        return temp
 
 tools = [market_lookup, search]
 
@@ -97,17 +139,26 @@ async def setup(state: State) -> State:
 
     if state.get("market_id"):
         state["random_market_chosen"] = await random_market(id=state["market_id"])
+    elif state.get("keywords"):
+        state["random_market_chosen"] = await random_market(keywords=state["keywords"])
     else:
         state["random_market_chosen"] = await random_market()
 
-    state["bull_system_prompt"] = SystemMessage(content="""
+
+    
+
+    state["bull_system_prompt"] = SystemMessage(content=f"""
     You are a bull analyst arguing that the answer to this prediction market is YES.
     Use your market_lookup and search tools to find evidence. Be persuasive and specific.
+    You MUST USE at least one instance of the following tools: {"\n".join(f"- {t.name}: {t.description}" for t in tools)}
+        MAKE SURE TO USE ALL OF YOUR TOOLS AT LEAST ONCE.
     """)
 
-    state["bear_system_prompt"] = SystemMessage(content="""
+    state["bear_system_prompt"] = SystemMessage(content=f"""
     You are a bear analyst arguing that the answer to this prediction market is NO.
     Use your market_lookup and search tools to find evidence. Be persuasive and specific.
+    You MUST USE at least one instance of the following tools: {"\n".join(f"- {t.name}: {t.description}" for t in tools)}
+    MAKE SURE TO USE ALL OF YOUR TOOLS AT LEAST ONCE.
     """)
 
     return state
@@ -194,6 +245,9 @@ compiled = graph.compile()
 
 def run_graph(args_dict):
     return asyncio.run(compiled.ainvoke(args_dict))
+
+async def arun_graph(args_dict):
+    return await compiled.ainvoke(args_dict)
 
 
 
