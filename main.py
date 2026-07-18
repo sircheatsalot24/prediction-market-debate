@@ -3,4 +3,4 @@ from asyncio import run
 
 run(main())
 
-print("Thanks for using!")
+print("\n\n\nThanks for using!")
