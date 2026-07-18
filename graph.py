@@ -1,21 +1,9 @@
-"""
-Eval plan:
-    1. DONE: refactor existing system to accept a market id param
-    2. design a eval db with input market ids and output AnalystResults and Verdicts
-    3. run a loop to graph.ainvoke() with every input value in eval db
-    4. collect the results in an evaluable format dict (in loop)
-    5. design a new populatable object that has:
-        5 criteria (out of 20, to add up to 100)
-        feedback category
-    6. run ChatOpenAI.with_structured_output for every execution of the graph in the evaluable dict
-    7. Average every score (out of 100) and collect feedback from the object
-"""
 from typing import List, TypedDict, Literal, Dict, Union
 from langchain.agents import create_agent
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from polymarket import AsyncPublicClient, Market 
+from polymarket import AsyncPublicClient, Market
 from langgraph.graph import END, START, StateGraph
 from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -46,7 +34,7 @@ openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 @tool
 async def search(question: str) -> list[dict]:
     """A search tool. Takes a question and returns web search outputs."""
-    print("used tool: search")
+    print("An agent used a tool: Search")
     response = await asyncio.to_thread(openai.responses.create,
         model="gpt-4o-mini",
         tools=[{"type": "web_search"}],
@@ -71,16 +59,16 @@ async def random_market(id: str = None, keywords: List[str] = []):
                 for item in raw.items:
                     for events in item.events:
                         for market in events.markets:
-                            if market.state.active and lower < float(market.outcomes.yes.price) < upper:
+                            if market.state.active and lower < float(market.outcomes.yes.price) < upper and market.prices.last_trade_price is not None:
                                 cands.append(market)
-                
+
                 if len(cands) != 0:
                     chosen = random.choice(cands)
                     found = True
                     break
                 else:
                     continue
-            
+
             if not found:
                 raise LookupError(f"No active market found for all keywords: {keywords}")
 
@@ -90,14 +78,14 @@ async def random_market(id: str = None, keywords: List[str] = []):
             first_page = await markets.first_page()
             items = first_page.items
             chosen = random.choice(items)
-        print(chosen.question, chosen.description)
+        print(f"Question: {chosen.question}")
     return {
         "id": chosen.id,
-        "question": chosen.question, 
-        "description": chosen.description, 
+        "question": chosen.question,
+        "description": chosen.description,
         "temp":  {
-                    "market question": chosen.question, 
-                    "market description": chosen.description, 
+                    "market question": chosen.question,
+                    "market description": chosen.description,
                     "market prices": {
                         "last trade price": float(chosen.prices.last_trade_price),
                         "one week change": float(chosen.prices.one_week_price_change or 0),
@@ -113,12 +101,12 @@ async def random_market(id: str = None, keywords: List[str] = []):
 @tool
 async def market_lookup(market_id: str):
     """A market lookup tool. Takes a market_id and returns values of the market"""
-    print("used tool: market lookup")
+    print("An agent used a tool: Market Lookup")
     async with AsyncPublicClient() as client:
         market = await client.get_market(id=market_id)
         temp = {
-                    "market question": market.question, 
-                    "market description": market.description, 
+                    "market question": market.question,
+                    "market description": market.description,
                     "market prices": {
                         "last trade price": float(market.prices.last_trade_price),
                         "one week change": float(market.prices.one_week_price_change or 0),
@@ -137,15 +125,13 @@ tools = [market_lookup, search]
 
 async def setup(state: State) -> State:
 
-    if state.get("market_id"):
-        state["random_market_chosen"] = await random_market(id=state["market_id"])
-    elif state.get("keywords"):
-        state["random_market_chosen"] = await random_market(keywords=state["keywords"])
-    else:
-        state["random_market_chosen"] = await random_market()
-
-
-    
+    if not state.get("random_market_chosen"):
+        if state.get("market_id"):
+            state["random_market_chosen"] = await random_market(id=state["market_id"])
+        elif state.get("keywords"):
+            state["random_market_chosen"] = await random_market(keywords=state["keywords"])
+        else:
+            state["random_market_chosen"] = await random_market()
 
     state["bull_system_prompt"] = SystemMessage(content=f"""
     You are a bull analyst arguing that the answer to this prediction market is YES.
@@ -165,7 +151,7 @@ async def setup(state: State) -> State:
 
 
 async def bull(state: State) -> Dict:
-    
+
     llm = create_agent(
         model = ChatOpenAI(model="gpt-4o-mini", temperature=0),
         tools=tools,
@@ -180,11 +166,11 @@ async def bull(state: State) -> Dict:
     cleaned = f"main reason: {response.main_reason}\nreasoning: {response.additional_reasoning}"
 
     if cleaned:
-        print(f"\n\n\n\n\n\n\nbull response: {cleaned}")
+        print("Bull responded!")
     return {"bull_result": response}
 
 async def bear(state: State) -> Dict:
-        
+
     llm = create_agent(
         model = ChatOpenAI(model="gpt-4o-mini", temperature=0),
         tools=tools,
@@ -199,9 +185,9 @@ async def bear(state: State) -> Dict:
     cleaned = f"main reason: {response.main_reason}\nreasoning: {response.additional_reasoning}"
 
     if cleaned:
-        print(f"\n\n\n\n\n\n\nbear response: {cleaned}")
+        print("Bear responded!")
     return {"bear_result": response}
-    
+
 
 def judge(state: State) -> Dict:
     random_market_chosen = state["random_market_chosen"]
@@ -222,7 +208,7 @@ def judge(state: State) -> Dict:
 
     judge = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(Verdict)
     result = judge.invoke(state["judge_messages"])
-    print(f"\n\n\n\n\n\njudge response: \nwinner: {result.final_decision}\nreasoning: {result.reasoning}")
+    print(f"Judge responded! Winner: {result.final_decision}")
     return {"verdict": result}
 
 graph = StateGraph(State)
@@ -248,7 +234,3 @@ def run_graph(args_dict):
 
 async def arun_graph(args_dict):
     return await compiled.ainvoke(args_dict)
-
-
-
-# print(result["verdict"], result["bear_result"], result["bull_result"])

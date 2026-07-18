@@ -4,7 +4,7 @@ from typing import Dict, List, TypedDict, Union
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-from predictionmarket import AnalystResult, Verdict, random_market, run_graph, arun_graph
+from graph import AnalystResult, Verdict, random_market, run_graph, arun_graph
 import asyncio, random
 
 @dataclass
@@ -104,14 +104,18 @@ def evaluate(mode: str, result, market_info):
     eval = eval_llm.invoke([SystemMessage(content = analyst_eval_system_prompt if mode == "analyst" else judge_eval_system_prompt), HumanMessage(content = f"Here is the {"analyst" if mode == "analyst" else "judge"}'s result:\n{result}\nHere is the market information: {market_info}")])
     return eval
 
-async def generate_testing_ids(amount):
-    testing_ids = []
-    while len(testing_ids) < amount:
-        temp = (await random_market(keywords=keywords))["id"]
-        if temp not in testing_ids:
-            testing_ids.append(temp)
+async def generate_testing_markets(amount):
+    testing_markets = []
+    seen_ids = set()
+    while len(testing_markets) < amount:
+        market = await random_market(keywords=keywords)
+        if market["id"] not in seen_ids:
+            seen_ids.add(market["id"])
+            testing_markets.append(market)
+        else:
+            print(f"Duplicate draw, retrying ({len(testing_markets)}/{amount} so far)")
 
-    return testing_ids
+    return testing_markets
 
 
 analyst_eval_system_prompt = """
@@ -135,12 +139,6 @@ analyst_eval_system_prompt = """
     bear argument, and do not let confidence or lively phrasing substitute for actual evidentiary support.
     Provide the sum of your five scores as "total", and 2-4 sentences of specific, actionable feedback
     explaining what was strong, what was weak, and why.
-
-
-
-
-
-
 """
 
 judge_eval_system_prompt = """
@@ -164,38 +162,40 @@ judge_eval_system_prompt = """
     should score low on identification regardless of which side it ultimately picked.
     Provide the sum of your five scores as "total", and 2-4 sentences of specific, actionable feedback
     explaining what was strong, what was weak, and why.
-
-
-
-
-
-
 """
 
 
 async def main():
-    testing_ids = await generate_testing_ids(3)
+    print("Starting eval cycle!")
+    testing_markets = await generate_testing_markets(int(input("Enter how many graph instances you would like:\n> ")))
 
     stored_results: Dict[str, GraphExecution] = {}
 
-    coroutine_list = []
+    completed = 0
 
-    for id in testing_ids:
-        coroutine_list.append(arun_graph({"market_id": id}))
+    async def tracked_run(args):
+        nonlocal completed
+        result = await arun_graph(args)
+        completed += 1
+        print(f"Completed graph execution #{completed} of {len(testing_markets)}!")
+        return result
+
+    coroutine_list = [tracked_run({"random_market_chosen": market}) for market in testing_markets]
 
     res = await asyncio.gather(*coroutine_list)
-    for id, result in zip(testing_ids, res):
-        stored_results[id] = GraphExecution(
+    for market, result in zip(testing_markets, res):
+        stored_results[market["id"]] = GraphExecution(
             bull_result=result["bull_result"],
             bear_result=result["bear_result"],
             judge_result=result["verdict"],
             market_info=result["random_market_chosen"]["temp"],
         )
 
-        
+    print("Successfully collected all graph executions!")
+
     compiled_evaluations: List[CompiledEvaluation] = []
 
-    for result in stored_results.values(): 
+    for result in stored_results.values():
         compiled_eval = CompiledEvaluation(
             bear_evaluation = evaluate("analyst", result.bear_result, result.market_info),
             bull_evaluation = evaluate("analyst", result.bull_result, result.market_info),
@@ -203,8 +203,9 @@ async def main():
         )
 
         compiled_evaluations.append(compiled_eval)
-            
 
+    print("Successfully built all compiled evaluations!")
+    print("Here are the stats:")
 
     bear_addedup_dict, bull_addedup_dict, judge_addedup_dict = defaultdict(int), defaultdict(int), defaultdict(int)
     bear_counter, bull_counter, judge_counter = 0, 0, 0
@@ -229,30 +230,29 @@ async def main():
     final_list = []
 
     for key in bear_addedup_dict:
-        x = (f"bear {key}: {round(bear_addedup_dict[key] / bear_counter, 3)}")
+        x = (f"Average Bear {key}: {round(bear_addedup_dict[key] / bear_counter, 3)}")
         final_list.append(x)
         print(x)
 
     for key in bull_addedup_dict:
-        x = (f"bull {key}: {round(bull_addedup_dict[key] / bull_counter, 3)}")
+        x = (f"Average Bull {key}: {round(bull_addedup_dict[key] / bull_counter, 3)}")
         final_list.append(x)
         print(x)
 
     for key in judge_addedup_dict:
-        x = (f"judge {key}: {round(judge_addedup_dict[key] / judge_counter, 3)}")
+        x = (f"Average Judge {key}: {round(judge_addedup_dict[key] / judge_counter, 3)}")
         final_list.append(x)
         print(x)
 
     final_list.extend([{"bear_feedback": bear_feedback, "bull_feedback": bull_feedback, "judge_feedback": judge_feedback}])
 
-    print(f"\n\nbear random feedback: {random.choice(bear_feedback)}")
-    print(f"\n\nbull random feedback: {random.choice(bull_feedback)}")
-    print(f"\n\njudge random feedback: {random.choice(judge_feedback)}")
+    print("Successfully interpreted evaluation data!")
 
     summarizer = ChatOpenAI(model = "gpt-4o-mini", temperature=0.5)
-    print(f"\n\n\nDebate Results:\n{summarizer.invoke([
-        SystemMessage(content = "You are a debate statistic summarizer. You take in feedback and stats from a finished, evaluated debate, and summarize them for a user to read, in order to understand the results of the debate. The user will see all the average total and criteria scores, so do not repeat them, as your main goal should be to provide feedback insight. DO NOT RESPOND IN MARKDOWN. RAW TEXT ONLY."),
-        HumanMessage(f"Here are the stats from the debate:\n{final_list}")
-    ]).content}")
+    messages = [SystemMessage(content = "You are a debate statistic summarizer. You take in feedback and stats from a finished, evaluated debate, and summarize them for a user to read, in order to understand the results of the debate. The user will see all the average total and criteria scores, so do not repeat them, as your main goal should be to provide feedback insight. DO NOT RESPOND IN MARKDOWN. RAW TEXT ONLY."), HumanMessage(f"Here are the stats from the debate:\n{final_list}")]
+    for chunk in summarizer.stream(messages):
+        print(chunk.content, end="", flush=True)
+    print()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
